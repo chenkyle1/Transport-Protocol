@@ -1,0 +1,154 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math
+import logging
+
+DATA_SIZE = 1375
+PACKET_COUNT = 4
+TIMEOUT = 1
+
+
+class Receiver:
+    def __init__(self):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('0.0.0.0', 0))
+        self.port = self.socket.getsockname()[1]
+        self.log("Bound to port %d" % self.port)
+        self.next_ack_number = None
+        self.window_size = DATA_SIZE * PACKET_COUNT
+        self.window = self.window_size
+        self.ack_timer = {}
+
+        self.buffer_packet = {}
+
+        self.remote_host = None
+        self.remote_port = None
+        self.time = time.time()
+
+    def send(self, message):
+        checksum = self.calc_checksum(message)
+        message["checksum"] = checksum
+        self.socket.sendto(json.dumps(message).encode('utf-8'), (self.remote_host, self.remote_port))
+
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    # if ack message was not acknowledge by a new msg then it will resend the ack incase it was dropped
+    def timed_out_resend(self):
+        timestamp_list = list(self.ack_timer.keys())
+        timestamp_list = list(filter(lambda timestamp: self.time - timestamp > TIMEOUT, timestamp_list))
+        if len(timestamp_list) > 0:
+            msg = self.ack_timer[timestamp_list[0]]
+            current_time = time.time()
+            msg["timestamp"] = current_time
+            self.ack_timer = {current_time: msg}
+            self.send(msg)
+
+    # checks the message type and feeds it to the function that deals with those type of messages
+    def handle_msg(self, msg):
+        if msg["type"] == "msg":
+            self.handle_type_msg(msg)
+
+    # This takes care of messages that are of type msg
+    def handle_type_msg(self, msg):
+        if self.next_ack_number == None:
+            # Print out the data to stdout
+            print(msg["data"], end='', flush=True)
+            msg_size = len(msg["data"])
+            self.next_ack_number = msg["sequence_number"] + msg_size
+            self.send_ack()
+        elif self.next_ack_number == msg["sequence_number"]:
+            # Print out the data to stdout
+            print(msg["data"], end='', flush=True)
+            msg_size = len(msg["data"])
+            self.next_ack_number = msg["sequence_number"] + msg_size
+            self.send_ack()
+        elif msg["sequence_number"] < self.next_ack_number:
+            # This means that recv has gotten an old packet and should respond with the last ack sequence number
+            self.send_ack()
+        elif msg["sequence_number"] > self.next_ack_number:
+            # TODO This means that recv has gotten a packet out of order
+            self.buffer_packet[msg["sequence_number"]] = msg
+            self.send_ack()
+        if self.window == 0:
+            self.send_ack()
+
+    # make sure that all received packets are dealt with and send the ack number
+    def send_ack(self):
+        if len(self.buffer_packet) > 0:
+            for i in range(len(self.buffer_packet)):
+                if self.buffer_packet.get(self.next_ack_number, False):
+                    buffer_msg = self.buffer_packet[self.next_ack_number]
+                    print(buffer_msg["data"], end='', flush=True)
+                    self.buffer_packet.pop(self.next_ack_number)
+                    self.next_ack_number += len(buffer_msg["data"])
+                else:
+                    break
+        self.window = (PACKET_COUNT - len(self.buffer_packet)) * DATA_SIZE
+        current_time = time.time()
+        new_msg = {"type": "ack", "ack_num": self.next_ack_number, "window": self.window, "timestamp": current_time}
+        self.send(new_msg)
+        self.log(str(new_msg))
+        self.ack_timer = {current_time: new_msg}
+
+    # checks if a message is a valid json
+    def valid_JSON(self, msg):
+        try:
+            json.loads(msg)
+            return True
+        except:
+            return False
+
+    # calculates the checksum of a msg
+    def calc_checksum(self, msg):
+        if "checksum" in msg:
+            del msg["checksum"]
+        if "timestamp" in msg:
+            del msg["timestamp"]
+        msg = json.dumps(msg, sort_keys=True).encode('utf-8')
+        words = [int.from_bytes(msg[i:i + 2], byteorder='big', signed=False) for i in
+                 range(0, len(msg), 2)]
+        words = [(~word & 0xFFFF) for word in words]
+        res = 0
+        for word in words:
+            res += word
+            res &= 0xFFFF
+        res = (~res & 0xFFFF)
+        return res
+
+    # checks if a message has a valid checksum
+    def valid_checksum(self, msg):
+        msg = json.loads(msg)
+        if "checksum" not in msg:
+            return False
+        received = msg["checksum"]
+        sent = self.calc_checksum(msg)
+        return received == sent
+
+    def run(self):
+        while True:
+            socks = select.select([self.socket], [], [])[0]
+
+            for conn in socks:
+                data, addr = conn.recvfrom(65535)
+                # Grab the remote host/port if we don't alreadt have it
+                if self.remote_host is None:
+                    self.remote_host = addr[0]
+                    self.remote_port = addr[1]
+                msg = data.decode("utf-8")
+                self.log("Received data message %s" % msg)
+                if self.valid_JSON(msg) and self.valid_checksum(msg):
+                    # self.time = msg["timestamp"]
+                    msg = json.loads(msg)
+                    self.time = time.time()
+                    self.handle_msg(msg)
+            self.timed_out_resend()
+        return
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='receive data')
+    args = parser.parse_args()
+    sender = Receiver()
+    sender.run()

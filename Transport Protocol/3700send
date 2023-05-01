@@ -1,0 +1,164 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math
+import logging
+import random
+
+DATA_SIZE = 1375
+PACKET_COUNT = 1
+
+
+class Sender:
+    def __init__(self, host, port):
+        self.window = DATA_SIZE * PACKET_COUNT
+        self.host = host
+        self.remote_port = int(port)
+        self.log("Sender starting up using port %s" % self.remote_port)
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('0.0.0.0', 0))
+        self.waiting = False
+        self.sequence_num = self.generate_sequence_number()
+        self.send_base = self.sequence_num
+        self.seq_num_list = {}
+        self.packet_timer = {}
+        self.rtt = 1
+        self.alpha = 0.125
+
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    def send(self, message):
+        checksum = self.calc_checksum(message)
+        message["checksum"] = checksum
+        self.socket.sendto(json.dumps(message).encode('utf-8'), (self.host, self.remote_port))
+
+    # creates a randome 32 bit number for the starting sequence number
+    def generate_sequence_number(self):
+        sequence_number = random.randint(0, 2 ** 32 - 1)
+        return sequence_number
+
+    # checks for any packets that have timed out and need to be resent
+    def timed_out_resend(self):
+        timestamp_list = list(self.packet_timer.keys())
+        # logging.warning(timestamp_list)
+        timestamp_list = list(filter(lambda timestamp: time.time() - timestamp > self.rtt, timestamp_list))
+        for each in timestamp_list:
+            # if self.window > 0:
+            msg = self.packet_timer[each]
+            self.packet_timer.pop(each)
+            current_time = time.time()
+            msg["timestamp"] = current_time
+            # checksum = self.calc_checksum(msg)
+            # msg["checksum"] = checksum
+            self.log("Sending message '%s'" % msg)
+            self.send(msg)
+            self.window -= len(msg["data"])
+            self.packet_timer[current_time] = msg
+            self.seq_num_list[msg["sequence_number"]] = msg
+
+    # takes care of messages from the receiver.
+    def handle_msg(self, msg):
+        if msg["type"] == "ack":
+            if msg["ack_num"] > self.send_base:
+                self.window = msg["window"]
+                self.send_base = msg["ack_num"]
+                temp_dict = {}
+                for timestamp, msg in self.packet_timer.items():
+                    if int(msg["sequence_number"]) >= self.send_base:
+                        temp_dict[timestamp] = msg
+                self.packet_timer = temp_dict
+            elif msg["ack_num"] < self.send_base:
+                pass
+            elif msg["ack_num"] == self.send_base:
+                self.window = msg["window"]
+                self.send_base = msg["ack_num"]
+                temp_dict = {}
+                for timestamp, msg in self.packet_timer.items():
+                    if int(msg["sequence_number"]) >= self.send_base:
+                        temp_dict[timestamp] = msg
+                self.packet_timer = temp_dict
+            if len(self.packet_timer) == 0 and self.window > 0:
+                self.waiting = False
+
+    # checks if a message is a valid json
+    def valid_JSON(self, msg):
+        try:
+            json.loads(msg)
+            return True
+        except:
+            return False
+
+    # calculates the checksum of a msg
+    def calc_checksum(self, msg):
+        if "checksum" in msg:
+            del msg["checksum"]
+        if "timestamp" in msg:
+            del msg["timestamp"]
+        msg = json.dumps(msg, sort_keys=True).encode('utf-8')
+        words = [int.from_bytes(msg[i:i + 2], byteorder='big', signed=False) for i in
+                 range(0, len(msg), 2)]
+        words = [(~word & 0xFFFF) for word in words]
+        res = 0
+        for word in words:
+            res += word
+            res &= 0xFFFF
+        res = (~res & 0xFFFF)
+        return res
+
+    # checks if a message has a valid checksum
+    def valid_checksum(self, msg):
+        msg = json.loads(msg)
+        received = msg["checksum"]
+        sent = self.calc_checksum(msg)
+        return received == sent
+
+    def run(self):
+        while True:
+            sockets = [self.socket, sys.stdin] if not self.waiting else [self.socket]
+            socks = select.select(sockets, [], [], 0.1)[0]
+            self.timed_out_resend()
+            for conn in socks:
+                if conn == self.socket:
+                    k, addr = conn.recvfrom(65535)
+                    msg = k.decode('utf-8')
+                    self.log("Received message '%s'" % msg)
+                    check = self.valid_JSON(msg) and self.valid_checksum(msg)
+                    logging.warning(check)
+                    if self.valid_JSON(msg):
+                        msg = json.loads(msg)
+                        self.handle_msg(msg)
+                elif conn == sys.stdin:
+                    data = sys.stdin.read(DATA_SIZE)
+                    bytes = len(data)
+                    if bytes == 0:
+                        if len(self.packet_timer) == 0:
+                            self.log("All done!")
+                            sys.exit(0)
+                        else:
+                            self.waiting = True
+                            break
+                    self.window = self.window - bytes
+                    current_time = time.time()
+                    msg = {"type": "msg", "data": data, "sequence_number": self.sequence_num, "window": self.window,
+                           "timestamp": current_time}
+                    # checksum = self.calc_checksum(msg)
+                    # msg["checksum"] = checksum
+                    self.packet_timer[current_time] = msg
+                    self.seq_num_list[self.sequence_num] = msg
+                    self.log("Sending message '%s'" % msg)
+                    self.send(msg)
+                    self.sequence_num += bytes
+                    if self.window == 0:
+                        self.waiting = True
+
+        return
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='send data')
+    parser.add_argument('host', type=str, help="Remote host to connect to")
+    parser.add_argument('port', type=int, help="UDP port number to connect to")
+    args = parser.parse_args()
+    sender = Sender(args.host, args.port)
+    sender.run()
